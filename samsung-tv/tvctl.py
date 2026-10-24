@@ -227,28 +227,44 @@ class TV:
         """Print TV events for a short window after a command (the 'logcat' of this TV)."""
         end = time.time() + seconds
         while time.time() < end:
-            msg = self.ws.recv(timeout=max(0.05, end - time.time()))
+            try:
+                msg = self.ws.recv(timeout=max(0.05, end - time.time()))
+            except (ConnectionError, OSError):
+                log("WARN", "TV closed the connection; reconnecting on the next command")
+                self.ws = None
+                return
             if msg is None:
                 return
             self._show(msg)
+
+    def _send(self, obj):
+        """Send, reconnecting once if the TV dropped the connection (it does after some key presses)."""
+        if self.ws is None:
+            self.connect()
+        try:
+            self.ws.send(obj)
+        except OSError:
+            log("WARN", "connection lost; reconnecting")
+            self.connect()
+            self.ws.send(obj)
 
     def key(self, key, hold=None):
         key = key.upper() if key.upper().startswith("KEY_") else "KEY_" + key.upper()
         log("CMD", f"key {key}" + (f" (hold {hold}s)" if hold else ""))
         params = {"Option": "false", "TypeOfRemote": "SendRemoteKey", "DataOfCmd": key}
         if hold:
-            self.ws.send({"method": "ms.remote.control", "params": {**params, "Cmd": "Press"}})
+            self._send({"method": "ms.remote.control", "params": {**params, "Cmd": "Press"}})
             time.sleep(hold)
-            self.ws.send({"method": "ms.remote.control", "params": {**params, "Cmd": "Release"}})
+            self._send({"method": "ms.remote.control", "params": {**params, "Cmd": "Release"}})
         else:
-            self.ws.send({"method": "ms.remote.control", "params": {**params, "Cmd": "Click"}})
+            self._send({"method": "ms.remote.control", "params": {**params, "Cmd": "Click"}})
         self.drain(0.6)
 
     def emit(self, event, data=None, wait_for=None, timeout=8):
         params = {"event": event, "to": "host"}
         if data is not None:
             params["data"] = data
-        self.ws.send({"method": "ms.channel.emit", "params": params})
+        self._send({"method": "ms.channel.emit", "params": params})
         end = time.time() + timeout
         while time.time() < end:
             msg = self.ws.recv(timeout=end - time.time())
@@ -270,11 +286,61 @@ class TV:
         log("CMD", f"launch {app_id}" + (f" with {meta!r}" if meta else ""))
         msg = self.emit("ed.apps.launch",
                         {"appId": app_id, "action_type": "DEEP_LINK", "metaTag": meta},
-                        wait_for="ed.apps.launch")
+                        wait_for="ed.apps.launch", timeout=3)
         if msg:
             self._show(msg)
         self.drain(1.5)
         return msg
+
+    def dial_base(self):
+        """Find the TV's DIAL server (what phones use to cast YouTube) via SSDP."""
+        cfg = load_config()
+        cached = cfg.get("dial", {}).get(self.host)
+        if cached:
+            return cached
+        base = None
+        msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\n"
+               "MX: 2\r\nST: urn:dial-multiscreen-org:service:dial:1\r\n\r\n").encode()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(3)
+        try:
+            sock.sendto(msg, ("239.255.255.250", 1900))
+            sock.sendto(msg, (self.host, 1900))
+            end = time.time() + 3
+            while time.time() < end and not base:
+                data, addr = sock.recvfrom(4096)
+                if addr[0] != self.host:
+                    continue
+                m = re.search(rb"(?im)^location:\s*(\S+)", data)
+                if m:
+                    with urllib.request.urlopen(m.group(1).decode(), timeout=3) as r:
+                        base = r.headers.get("Application-URL")
+        except OSError as e:
+            log("WARN", f"DIAL discovery: {e}")
+        finally:
+            sock.close()
+        base = base or f"http://{self.host}:8080/ws/apps/"
+        log("INFO", f"DIAL server: {base}")
+        cfg.setdefault("dial", {})[self.host] = base
+        save_config(cfg)
+        return base
+
+    def youtube_dial(self, video_id):
+        """Open YouTube directly on a video, the way 'cast to TV' does."""
+        url = self.dial_base().rstrip("/") + "/YouTube"
+        log("CMD", f"DIAL POST {url} v={video_id}")
+        req = urllib.request.Request(url, data=f"v={video_id}".encode(), method="POST",
+                                     headers={"Content-Type": "text/plain; charset=utf-8"})
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                log("INFO", f"DIAL answered {r.status}")
+                return r.status in (200, 201)
+        except Exception as e:
+            log("WARN", f"DIAL launch failed: {e}")
+            cfg = load_config()
+            cfg.get("dial", {}).pop(self.host, None)  # rediscover next time
+            save_config(cfg)
+            return False
 
     def apps_or_probe(self):
         try:
@@ -436,17 +502,14 @@ def cmd_youtube(args):
     tv.key("HOME")
     time.sleep(1.5)
 
+    def open_video():
+        if not tv.youtube_dial(vid):
+            log("INFO", "falling back to Samsung's app launch")
+            tv.launch(YOUTUBE_APP_ID, f"v={vid}")
+        time.sleep(args.wait)
+
     log("STEP", "2/4 open YouTube on the video")
-    if not tv.launch(YOUTUBE_APP_ID, f"v={vid}"):
-        log("WARN", "no launch reply; trying the REST endpoint")
-        req = urllib.request.Request(
-            f"http://{tv.host}:8001/api/v2/applications/{YOUTUBE_APP_ID}",
-            data=f"v={vid}".encode(), method="POST")
-        try:
-            urllib.request.urlopen(req, timeout=5)
-        except Exception as e:
-            log("WARN", f"REST launch failed: {e}")
-    time.sleep(args.wait)
+    open_video()
     log("INFO", f"YouTube status: {tv.app_status(YOUTUBE_APP_ID)}")
 
     log("STEP", "3/4 'Who's watching?' check")
@@ -461,8 +524,7 @@ def cmd_youtube(args):
             tv.key("ENTER")
             time.sleep(3)
             log("STEP", "re-sending the video after the profile was chosen")
-            tv.launch(YOUTUBE_APP_ID, f"v={vid}")
-            time.sleep(args.wait)
+            open_video()
 
     log("STEP", "4/4 playback")
     if confirm("Is the video playing? (answer n to press Play)", args.yes):
