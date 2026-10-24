@@ -16,6 +16,7 @@ import datetime
 import json
 import os
 import re
+import select
 import socket
 import ssl
 import struct
@@ -96,14 +97,25 @@ class WebSocket:
         if " 101 " not in status + " ":
             raise ConnectionError(f"websocket upgrade refused: {status}")
 
-    def _read(self, n):
+    def _fill(self, n, deadline):
+        """Make sure n bytes are buffered, giving up at a hard deadline."""
         while len(self.buf) < n:
-            chunk = self.sock.recv(65536)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError
+            # select() enforces the deadline even where an SSL read ignores the
+            # socket timeout (seen with macOS's bundled Python 3.9).
+            pending = getattr(self.sock, "pending", lambda: 0)()
+            if not pending and not select.select([self.sock], [], [], remaining)[0]:
+                raise TimeoutError
+            self.sock.settimeout(max(remaining, 0.01))
+            try:
+                chunk = self.sock.recv(65536)
+            except (socket.timeout, ssl.SSLWantReadError):
+                continue
             if not chunk:
                 raise ConnectionError("TV closed the connection")
             self.buf += chunk
-        out, self.buf = self.buf[:n], self.buf[n:]
-        return out
 
     def _send_frame(self, opcode, payload):
         header = bytes([0x80 | opcode])
@@ -121,20 +133,30 @@ class WebSocket:
         self._send_frame(0x1, json.dumps(obj).encode())
 
     def recv(self, timeout):
-        """Return the next text message as a dict, or None on timeout."""
-        self.sock.settimeout(timeout)
+        """Return the next text message as a dict, or None on timeout.
+
+        A frame is only taken off the buffer once it has fully arrived, so a
+        timeout never leaves the stream half-read."""
+        deadline = time.time() + timeout
         message = b""
         try:
             while True:
-                b0, b1 = self._read(2)
-                opcode, n = b0 & 0x0F, b1 & 0x7F
+                self._fill(2, deadline)
+                b0, b1 = self.buf[0], self.buf[1]
+                opcode, n, pos = b0 & 0x0F, b1 & 0x7F, 2
                 if n == 126:
-                    n = struct.unpack("!H", self._read(2))[0]
+                    self._fill(4, deadline)
+                    n, pos = struct.unpack("!H", self.buf[2:4])[0], 4
                 elif n == 127:
-                    n = struct.unpack("!Q", self._read(8))[0]
-                mask = self._read(4) if b1 & 0x80 else None
-                data = self._read(n)
-                if mask:
+                    self._fill(10, deadline)
+                    n, pos = struct.unpack("!Q", self.buf[2:10])[0], 10
+                masked = b1 & 0x80
+                total = pos + (4 if masked else 0) + n
+                self._fill(total, deadline)
+                frame, self.buf = self.buf[:total], self.buf[total:]
+                data = frame[total - n:]
+                if masked:
+                    mask = frame[pos:pos + 4]
                     data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
                 if opcode == 0x9:
                     self._send_frame(0xA, data)
@@ -145,7 +167,7 @@ class WebSocket:
                     message += data
                     if b0 & 0x80:
                         return json.loads(message.decode(errors="replace"))
-        except (socket.timeout, TimeoutError):
+        except TimeoutError:
             return None
 
     def close(self):
@@ -261,6 +283,7 @@ class TV:
             log("WARN", "TV did not send its app list (normal on many 2021+ models); checking common apps one by one")
         found = []
         for app_id, name in KNOWN_APPS.items():
+            log("INFO", f"checking {name}")
             st = self.app_status(app_id)
             if "error" not in st:
                 found.append({"appId": app_id, "name": st.get("name") or name, "probed": True})
@@ -270,7 +293,7 @@ class TV:
     def app_status(self, app_id):
         url = f"http://{self.host}:8001/api/v2/applications/{app_id}"
         try:
-            with urllib.request.urlopen(url, timeout=5) as r:
+            with urllib.request.urlopen(url, timeout=3) as r:
                 return json.load(r)
         except Exception as e:  # newer firmware may refuse this endpoint
             return {"error": str(e)}
@@ -359,6 +382,8 @@ def cmd_backup(args):
     log("CMD", f"backup to {folder}")
     with open(os.path.join(folder, "device.json"), "w") as f:
         json.dump(tv.info(), f, indent=2)
+    with open(os.path.join(folder, "settings-before.txt"), "w") as f:
+        f.write(SETTINGS_TEMPLATE)
     tv.connect()
     apps = tv.apps_or_probe()
     tv.close()
@@ -367,8 +392,6 @@ def cmd_backup(args):
     with open(os.path.join(folder, "apps.txt"), "w") as f:
         for a in sorted(apps, key=lambda a: a.get("name", "")):
             f.write(f"{a.get('appId', ''):<30} {a.get('name', '')}\n")
-    with open(os.path.join(folder, "settings-before.txt"), "w") as f:
-        f.write(SETTINGS_TEMPLATE)
     print(f"Saved device.json, apps.json, apps.txt and settings-before.txt in {folder}")
     print("Fill in settings-before.txt from the TV before changing anything (see README).")
 
@@ -516,6 +539,9 @@ def main():
     args = p.parse_args()
     try:
         args.fn(args)
+    except KeyboardInterrupt:
+        log("STOP", "cancelled with Ctrl-C")
+        sys.exit(130)
     except (OSError, PermissionError, TimeoutError, LookupError, ConnectionError) as e:
         log("ERR", str(e))
         if "No route to host" in str(e) and sys.platform == "darwin":
