@@ -106,16 +106,22 @@ python3 tvctl.py monitor                     # live log, second terminal
 ```
 Common keys: `HOME RETURN EXIT UP DOWN LEFT RIGHT ENTER PLAY PAUSE STOP FF REWIND VOLUP VOLDOWN MUTE CHUP CHDOWN SOURCE MENU POWER 0-9 (KEY_0…)`.
 
-## Undo everything
+## What was changed on this TV (Q60AA, 25 Oct 2026)
 
-| What | How |
-|---|---|
-| A, B | Privacy Choices → turn Interest-Based Advertisement and Viewing Information Services back on |
-| C | Smart Features → Autorun Smart Hub and Autorun Last App back on |
-| D | IP Settings → DNS setting → Obtain automatically |
-| E | Apps → Settings → highlight the app → Add to Home |
-| F | Power and Energy Saving → Instant On off |
-| Pairing | Settings → General → External Device Manager → Device Connection Manager → Device List → delete *tvctl*; on the computer `rm -r ~/.samsung-tv` |
-| Developer Mode | Apps → 1 2 3 4 5 → Off → restart TV |
+"Before" values come from photos of each screen taken before the change.
 
-Compare against `backup-<date>/settings-before.txt` to put back exactly what was there.
+| Step | Setting | Before | After | Undo |
+|---|---|---|---|---|
+| A | Privacy Choices → Interest-Based Advertisements | ticked | unticked | Home → Privacy Choices tile → tick it → OK. Don't use "I agree to all" unless you want everything back on. |
+| B | Privacy Choices → Viewing Information Services | ticked | unticked | Same screen, tick it → OK |
+| C | General → Smart Features → Autorun Smart Hub | on | off | Same screen → OK on it |
+| C | General → Smart Features → Autorun Samsung TV Plus | on | off, only if you chose to | Same screen → OK on it |
+| D | General → Network → Network Status → IP Settings → DNS setting | Get automatically (192.168.0.1) | Enter manually, 94.140.14.14 (AdGuard DNS) | DNS setting → Get automatically → OK |
+| E | Home-bar "Ad" tile | shown | gone (blocked by the DNS in D) | Comes back with D's undo |
+| F | Support → Device Care → Start Device Care | — | run once | Nothing to undo |
+
+Left as they were: IP setting (Get automatically), Autorun Last App (off), Autorun Multi View Mirroring (on), Remote Management (off), voice services, and every app. Nothing was uninstalled.
+
+Pairing with this computer: Settings → General → External Device Manager → Device Connection Manager → Device List → delete *tvctl*. On the computer, run `rm -r ~/.samsung-tv`.
+
+The backup from before the changes (device info and app list) is in `~/Downloads/backup-20261025-005123/` on the Mac.
