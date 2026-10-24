@@ -1,0 +1,76 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+    width: 1920px;
+    height: 1080px;
+    overflow: hidden;
+    background: #0b0b0f;
+    color: #f5f5f7;
+    font-family: "SamsungOne", "Helvetica Neue", Arial, sans-serif;
+}
+
+/* Soft, blurred copy of the focused app's icon, like Apple TV's top shelf. */
+#backdrop {
+    position: absolute;
+    top: -120px; right: -120px; bottom: -120px; left: -120px;
+    background-size: cover;
+    background-position: center;
+    filter: blur(120px) saturate(140%);
+    opacity: 0.35;
+    transition: background-image 0.4s ease;
+}
+
+header {
+    position: relative;
+    display: flex;
+    justify-content: space-between;
+    padding: 64px 112px 0;
+    font-size: 34px;
+    color: rgba(245, 245, 247, 0.75);
+}
+
+#clock { font-weight: 300; font-size: 44px; color: #f5f5f7; }
+
+main {
+    position: relative;
+    padding: 0 112px;
+    margin-top: 300px;
+}
+
+#focused-name {
+    font-size: 52px;
+    font-weight: 600;
+    height: 72px;
+    margin-bottom: 36px;
+    letter-spacing: 0.5px;
+}
+
+#grid {
+    display: grid;
+    grid-template-columns: repeat(5, 300px);
+    gap: 48px 40px;
+}
+
+.tile {
+    width: 300px;
+    height: 180px;
+    border-radius: 24px;
+    background: #1c1c22;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+    transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.tile img { max-width: 70%; max-height: 70%; object-fit: contain; }
+
+.tile .label { font-size: 34px; font-weight: 600; padding: 0 20px; text-align: center; }
+
+.tile.focused {
+    transform: scale(1.12);
+    box-shadow: 0 28px 48px rgba(0, 0, 0, 0.6), 0 0 0 4px rgba(255, 255, 255, 0.9);
+}
+
+#message { margin-top: 48px; font-size: 30px; color: rgba(245, 245, 247, 0.6); }

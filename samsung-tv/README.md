@@ -72,6 +72,10 @@ TV Bro is an Android app and can't run on Tizen. The official route for open-sou
 
 The built-in Samsung **Internet** browser, the "Browser" tile on your home bar, already covers browsing.
 
+## Clean Home launcher
+
+An ad-free, Apple TV-style app grid for this TV. It's installed with Samsung's official Developer Mode. See [launcher/README.md](launcher/README.md).
+
 ## 6. One command: YouTube + a video you name
 
 ```sh

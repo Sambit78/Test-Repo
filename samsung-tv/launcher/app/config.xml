@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget xmlns="http://www.w3.org/ns/widgets" xmlns:tizen="http://tizen.org/ns/widgets"
+        id="http://github.com/Sambit78/Test-Repo/CleanHome" version="1.0.0" viewmodes="maximized">
+    <tizen:application id="CleanHome1.CleanHome" package="CleanHome1" required_version="3.0"/>
+    <tizen:profile name="tv-samsung"/>
+    <content src="index.html"/>
+    <icon src="icon.png"/>
+    <name>Clean Home</name>
+    <feature name="http://tizen.org/feature/screen.size.all"/>
+    <tizen:privilege name="http://tizen.org/privilege/application.launch"/>
+    <tizen:privilege name="http://tizen.org/privilege/application.info"/>
+    <tizen:setting screen-orientation="landscape" context-menu="disable" background-support="disable"
+                   encryption="disable" install-location="auto" hwkey-event="enable"/>
+</widget>
