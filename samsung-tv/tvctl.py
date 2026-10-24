@@ -296,7 +296,11 @@ def youtube_video_id(query):
 
 
 def host_arg(args):
-    host = args.tv or load_config().get("default_tv")
+    cfg = load_config()
+    host = args.tv or cfg.get("default_tv")
+    if args.tv and cfg.get("default_tv") != args.tv:
+        cfg["default_tv"] = args.tv
+        save_config(cfg)
     if not host:
         sys.exit("Give the TV's IP with --tv 192.168.x.y (it is remembered after the first time).")
     return host
