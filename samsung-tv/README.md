@@ -79,12 +79,17 @@ python3 tvctl.py youtube "lofi hip hop radio"                 # a title: plays t
 python3 tvctl.py youtube https://www.youtube.com/watch?v=XXXX # or a URL / video ID
 ```
 Each step shows on the TV and in the monitor:
-1. Presses **Home**.
-2. Opens YouTube straight on the video, using Samsung's deep link.
-3. **"Who's watching?"**: the TV API can't take screenshots, so the script **asks you** whether the picker is showing. You confirm the highlighted profile. To move the highlight first, run `python3 tvctl.py key LEFT` or `key RIGHT`. Then it presses OK and sends the video again.
-4. Asks whether the video is playing, and presses **Play** if it isn't.
+1. **Casts the video**, the same way the YouTube app on a phone does: the script reads the TV's YouTube screen ID from its DIAL entry (`http://TV:8080/ws/app/YouTube`), pairs with it through youtube.com's cast ("lounge") service and queues the video. If YouTube is closed, it is started first. Nothing is signed in. A plain DIAL launch and Samsung's own app launch are kept as fallbacks.
+2. **Asks what's on the TV.** The TV API can't take screenshots, so you answer:
+   - `p`: playing, done
+   - `s`: paused, so it presses Play
+   - `w`: **"Who's watching?"**. Move with `l`/`r` and press OK with `o` once your profile is highlighted
+   - `h`: YouTube home or something else, so it sends the video again
+   - `q`: quit
 
-The script never presses OK without asking you first. Add `-y` to skip those questions once you trust it.
+The script never presses OK unless you ask it to. Add `-y` to skip the questions.
+
+Tested on a Q60AA (2021): the plain DIAL `v=` launch and Samsung's deep link both open YouTube's home screen; only the cast pairing plays the video.
 
 ## Cheat sheet
 

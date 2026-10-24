@@ -589,10 +589,6 @@ def cmd_youtube(args):
     tv = TV(host_arg(args))
     tv.connect()
 
-    log("STEP", "1/3 Home")
-    tv.key("HOME")
-    time.sleep(1.5)
-
     def open_video(cold):
         if tv.youtube_lounge_play(vid):
             time.sleep(args.wait)
@@ -609,11 +605,11 @@ def cmd_youtube(args):
         tv.launch(YOUTUBE_APP_ID, f"v={vid}")
         time.sleep(args.wait)
 
-    log("STEP", "2/3 open YouTube on the video")
+    log("STEP", "1/2 open YouTube on the video")
     open_video(cold=True)
     log("INFO", f"YouTube status: {tv.app_status(YOUTUBE_APP_ID)}")
 
-    log("STEP", "3/3 check the screen")
+    log("STEP", "2/2 check the screen")
     if args.yes:
         log("DONE", f"sent {title}")
         tv.close()
