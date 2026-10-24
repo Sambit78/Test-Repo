@@ -525,7 +525,7 @@ def cmd_youtube(args):
     tv = TV(host_arg(args))
     tv.connect()
 
-    log("STEP", "1/4 Home")
+    log("STEP", "1/3 Home")
     tv.key("HOME")
     time.sleep(1.5)
 
@@ -541,30 +541,47 @@ def cmd_youtube(args):
         tv.launch(YOUTUBE_APP_ID, f"v={vid}")
         time.sleep(args.wait)
 
-    log("STEP", "2/4 open YouTube on the video")
+    log("STEP", "2/3 open YouTube on the video")
     open_video(cold=True)
     log("INFO", f"YouTube status: {tv.app_status(YOUTUBE_APP_ID)}")
 
-    log("STEP", "3/4 'Who's watching?' check")
-    if not args.yes:
-        seen = input("\n>>> Is the TV showing \"Who's watching?\"  [y = yes / Enter = no] ").strip().lower()
-        if seen in ("y", "yes"):
-            if not confirm("Is YOUR profile highlighted? (use `tvctl.py key LEFT/RIGHT` "
-                           "in another terminal to move it first)", False):
-                log("STOP", "left the profile picker for you; run this command again after choosing")
-                tv.close()
-                return
-            tv.key("ENTER")
-            time.sleep(3)
-            log("STEP", "re-sending the video after the profile was chosen")
+    log("STEP", "3/3 check the screen")
+    if args.yes:
+        log("DONE", f"sent {title}")
+        tv.close()
+        return
+    # No screenshots on Tizen: the person watching says what is on screen, and
+    # OK is only pressed when they ask for it.
+    menu = ("\n>>> What is on the TV?\n"
+            "    p = the video is playing        s = paused on the video (press Play)\n"
+            "    w = \"Who's watching?\" screen   h = YouTube home / something else (send the video again)\n"
+            "    q = quit\n>>> ")
+    while True:
+        ans = input(menu).strip().lower()
+        if ans == "p":
+            log("DONE", f"playing {title}")
+            break
+        if ans == "s":
+            tv.key("PLAY")
+        elif ans == "w":
+            log("STEP", "profile picker")
+            while True:
+                k = input(">>> Move with l / r, press OK with o when YOUR profile is highlighted, b = back: ").strip().lower()
+                if k in ("l", "r"):
+                    tv.key("LEFT" if k == "l" else "RIGHT")
+                elif k == "o":
+                    tv.key("ENTER")
+                    log("INFO", "profile chosen; YouTube should continue to the video")
+                    time.sleep(4)
+                    break
+                elif k == "b":
+                    break
+        elif ans == "h":
+            log("STEP", "sending the video again")
             open_video(cold=False)
-
-    log("STEP", "4/4 playback")
-    if confirm("Is the video playing? (answer n to press Play)", args.yes):
-        log("DONE", f"playing {title}")
-    else:
-        tv.key("PLAY")
-        log("DONE", "sent Play")
+        elif ans == "q":
+            log("STOP", "left as is")
+            break
     tv.close()
 
 
