@@ -22,6 +22,7 @@ import ssl
 import struct
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -326,21 +327,47 @@ class TV:
         return base
 
     def youtube_dial(self, video_id):
-        """Open YouTube directly on a video, the way 'cast to TV' does."""
+        """Open YouTube directly on a video, the way 'cast to TV' does.
+
+        YouTube's DIAL server refuses (403) callers it doesn't recognise, so the
+        request names YouTube's own clients as its origin, as phones do."""
         url = self.dial_base().rstrip("/") + "/YouTube"
-        log("CMD", f"DIAL POST {url} v={video_id}")
-        req = urllib.request.Request(url, data=f"v={video_id}".encode(), method="POST",
-                                     headers={"Content-Type": "text/plain; charset=utf-8"})
+        for origin in ("https://www.youtube.com", "package:com.google.android.youtube", None):
+            headers = {"Content-Type": "text/plain; charset=utf-8"}
+            if origin:
+                headers["Origin"] = origin
+            log("CMD", f"DIAL POST {url} v={video_id} (origin {origin or 'none'})")
+            req = urllib.request.Request(url, data=f"v={video_id}".encode(), method="POST", headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    log("INFO", f"DIAL answered {r.status}")
+                    return r.status in (200, 201)
+            except urllib.error.HTTPError as e:
+                log("WARN", f"DIAL refused: {e.code} {e.reason}")
+            except Exception as e:
+                log("WARN", f"DIAL launch failed: {e}")
+                cfg = load_config()
+                cfg.get("dial", {}).pop(self.host, None)  # rediscover next time
+                save_config(cfg)
+                return False
+        return False
+
+    def close_app(self, app_id):
+        """Close an app so the next launch is a cold start (deep links only apply then)."""
+        log("CMD", f"close {app_id}")
+        req = urllib.request.Request(f"http://{self.host}:8001/api/v2/applications/{app_id}", method="DELETE")
         try:
-            with urllib.request.urlopen(req, timeout=8) as r:
-                log("INFO", f"DIAL answered {r.status}")
-                return r.status in (200, 201)
+            urllib.request.urlopen(req, timeout=5).close()
         except Exception as e:
-            log("WARN", f"DIAL launch failed: {e}")
-            cfg = load_config()
-            cfg.get("dial", {}).pop(self.host, None)  # rediscover next time
-            save_config(cfg)
+            log("WARN", f"close failed: {e}")
             return False
+        for _ in range(10):
+            time.sleep(0.5)
+            if not self.app_status(app_id).get("running"):
+                log("INFO", "closed")
+                return True
+        log("WARN", "app still reports running")
+        return False
 
     def apps_or_probe(self):
         try:
@@ -502,14 +529,20 @@ def cmd_youtube(args):
     tv.key("HOME")
     time.sleep(1.5)
 
-    def open_video():
-        if not tv.youtube_dial(vid):
-            log("INFO", "falling back to Samsung's app launch")
-            tv.launch(YOUTUBE_APP_ID, f"v={vid}")
+    def open_video(cold):
+        if tv.youtube_dial(vid):
+            time.sleep(args.wait)
+            return
+        log("INFO", "falling back to Samsung's app launch")
+        # The video in a Samsung launch is only honoured when YouTube starts from closed.
+        if cold and tv.app_status(YOUTUBE_APP_ID).get("running"):
+            tv.close_app(YOUTUBE_APP_ID)
+            time.sleep(1)
+        tv.launch(YOUTUBE_APP_ID, f"v={vid}")
         time.sleep(args.wait)
 
     log("STEP", "2/4 open YouTube on the video")
-    open_video()
+    open_video(cold=True)
     log("INFO", f"YouTube status: {tv.app_status(YOUTUBE_APP_ID)}")
 
     log("STEP", "3/4 'Who's watching?' check")
@@ -524,7 +557,7 @@ def cmd_youtube(args):
             tv.key("ENTER")
             time.sleep(3)
             log("STEP", "re-sending the video after the profile was chosen")
-            open_video()
+            open_video(cold=False)
 
     log("STEP", "4/4 playback")
     if confirm("Is the video playing? (answer n to press Play)", args.yes):
