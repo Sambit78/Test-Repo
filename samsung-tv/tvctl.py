@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""tvctl - control a Samsung Tizen TV over its official local-network remote API.
+
+Standard library only. Talks to the TV's built-in endpoints:
+  http://TV:8001/api/v2/                         device info (no pairing needed)
+  wss://TV:8002/api/v2/channels/samsung.remote.control   key presses, app list, app launch
+The first websocket connection makes the TV show an "Allow" prompt; the token it
+returns is saved in ~/.samsung-tv/ so later runs don't prompt again.
+
+Every command is logged with a timestamp to ~/.samsung-tv/session.log, and the TV's
+event stream is printed only while that command runs. `tvctl.py monitor` tails it.
+"""
+import argparse
+import base64
+import datetime
+import json
+import os
+import re
+import socket
+import ssl
+import struct
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+HOME = os.path.expanduser("~/.samsung-tv")
+CONFIG = os.path.join(HOME, "config.json")
+LOG = os.path.join(HOME, "session.log")
+CLIENT_NAME = "tvctl"
+YOUTUBE_APP_ID = "111299001912"
+
+
+# ---------- logging / monitor ----------
+
+def stamp():
+    return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+
+def log(kind, text):
+    line = f"[{stamp()}] {kind:<5} {text}"
+    print(line, flush=True)
+    os.makedirs(HOME, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+
+
+def load_config():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    os.makedirs(HOME, exist_ok=True)
+    with open(CONFIG, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG, 0o600)
+
+
+# ---------- minimal websocket client (RFC 6455) ----------
+
+class WebSocket:
+    def __init__(self, host, port, path, use_tls):
+        raw = socket.create_connection((host, port), timeout=10)
+        if use_tls:
+            # The TV serves a self-signed certificate on 8002; verification is
+            # skipped for this one LAN connection only.
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            raw = ctx.wrap_socket(raw, server_hostname=host)
+        self.sock = raw
+        self.buf = b""
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n")
+        self.sock.sendall(req.encode())
+        while b"\r\n\r\n" not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("TV closed the connection during handshake")
+            self.buf += chunk
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n", 1)[0].decode(errors="replace")
+        if " 101 " not in status + " ":
+            raise ConnectionError(f"websocket upgrade refused: {status}")
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("TV closed the connection")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def _send_frame(self, opcode, payload):
+        header = bytes([0x80 | opcode])
+        n = len(payload)
+        if n < 126:
+            header += bytes([0x80 | n])
+        elif n < 65536:
+            header += bytes([0x80 | 126]) + struct.pack("!H", n)
+        else:
+            header += bytes([0x80 | 127]) + struct.pack("!Q", n)
+        mask = os.urandom(4)
+        self.sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def send(self, obj):
+        self._send_frame(0x1, json.dumps(obj).encode())
+
+    def recv(self, timeout):
+        """Return the next text message as a dict, or None on timeout."""
+        self.sock.settimeout(timeout)
+        message = b""
+        try:
+            while True:
+                b0, b1 = self._read(2)
+                opcode, n = b0 & 0x0F, b1 & 0x7F
+                if n == 126:
+                    n = struct.unpack("!H", self._read(2))[0]
+                elif n == 127:
+                    n = struct.unpack("!Q", self._read(8))[0]
+                mask = self._read(4) if b1 & 0x80 else None
+                data = self._read(n)
+                if mask:
+                    data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+                if opcode == 0x9:
+                    self._send_frame(0xA, data)
+                    continue
+                if opcode == 0x8:
+                    raise ConnectionError("TV closed the websocket")
+                if opcode in (0x0, 0x1):
+                    message += data
+                    if b0 & 0x80:
+                        return json.loads(message.decode(errors="replace"))
+        except (socket.timeout, TimeoutError):
+            return None
+
+    def close(self):
+        try:
+            self._send_frame(0x8, b"")
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# ---------- TV session ----------
+
+class TV:
+    def __init__(self, host, port=8002):
+        self.host, self.port = host, port
+        self.ws = None
+
+    def info(self):
+        url = f"http://{self.host}:8001/api/v2/"
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return json.load(r)
+
+    def connect(self):
+        cfg = load_config()
+        token = cfg.get("tokens", {}).get(self.host, "")
+        name = base64.b64encode(CLIENT_NAME.encode()).decode()
+        path = f"/api/v2/channels/samsung.remote.control?name={name}"
+        if token:
+            path += f"&token={token}"
+        log("CONN", f"wss://{self.host}:{self.port} (token {'saved' if token else 'none - look at the TV and press Allow'})")
+        self.ws = WebSocket(self.host, self.port, path, use_tls=self.port != 8001)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            msg = self.ws.recv(timeout=deadline - time.time())
+            if msg is None:
+                break
+            self._show(msg)
+            event = msg.get("event")
+            if event == "ms.channel.connect":
+                new = (msg.get("data") or {}).get("token")
+                if new and new != token:
+                    cfg.setdefault("tokens", {})[self.host] = new
+                    save_config(cfg)
+                    log("CONN", "TV approved this computer; token saved")
+                return
+            if event == "ms.channel.unauthorized":
+                raise PermissionError("TV denied the connection. On the TV: Settings > General > "
+                                      "External Device Manager > Device Connection Manager > Device List, "
+                                      "allow 'tvctl', then retry.")
+        raise TimeoutError("No answer from the TV within 30 s (was the Allow prompt accepted?)")
+
+    def _show(self, msg):
+        text = json.dumps(msg)
+        log("TV", text if len(text) < 400 else text[:400] + " ...")
+
+    def drain(self, seconds):
+        """Print TV events for a short window after a command (the 'logcat' of this TV)."""
+        end = time.time() + seconds
+        while time.time() < end:
+            msg = self.ws.recv(timeout=max(0.05, end - time.time()))
+            if msg is None:
+                return
+            self._show(msg)
+
+    def key(self, key, hold=None):
+        key = key.upper() if key.upper().startswith("KEY_") else "KEY_" + key.upper()
+        log("CMD", f"key {key}" + (f" (hold {hold}s)" if hold else ""))
+        params = {"Option": "false", "TypeOfRemote": "SendRemoteKey", "DataOfCmd": key}
+        if hold:
+            self.ws.send({"method": "ms.remote.control", "params": {**params, "Cmd": "Press"}})
+            time.sleep(hold)
+            self.ws.send({"method": "ms.remote.control", "params": {**params, "Cmd": "Release"}})
+        else:
+            self.ws.send({"method": "ms.remote.control", "params": {**params, "Cmd": "Click"}})
+        self.drain(0.6)
+
+    def emit(self, event, data=None, wait_for=None, timeout=8):
+        params = {"event": event, "to": "host"}
+        if data is not None:
+            params["data"] = data
+        self.ws.send({"method": "ms.channel.emit", "params": params})
+        end = time.time() + timeout
+        while time.time() < end:
+            msg = self.ws.recv(timeout=end - time.time())
+            if msg is None:
+                break
+            if msg.get("event") == wait_for:
+                return msg
+            self._show(msg)
+        return None
+
+    def apps(self):
+        log("CMD", "list installed apps")
+        msg = self.emit("ed.installedApp.get", wait_for="ed.installedApp.get")
+        if not msg:
+            raise TimeoutError("TV did not return its app list")
+        return (msg.get("data") or {}).get("data", [])
+
+    def launch(self, app_id, meta=""):
+        log("CMD", f"launch {app_id}" + (f" with {meta!r}" if meta else ""))
+        msg = self.emit("ed.apps.launch",
+                        {"appId": app_id, "action_type": "DEEP_LINK", "metaTag": meta},
+                        wait_for="ed.apps.launch")
+        if msg:
+            self._show(msg)
+        self.drain(1.5)
+        return msg
+
+    def app_status(self, app_id):
+        url = f"http://{self.host}:8001/api/v2/applications/{app_id}"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return json.load(r)
+        except Exception as e:  # newer firmware may refuse this endpoint
+            return {"error": str(e)}
+
+    def close(self):
+        if self.ws:
+            self.ws.close()
+
+
+# ---------- helpers ----------
+
+def confirm(question, assume_yes):
+    """The TV API has no screenshot, so the person watching confirms the screen."""
+    if assume_yes:
+        return True
+    answer = input(f"\n>>> {question} [y/N] ").strip().lower()
+    return answer in ("y", "yes")
+
+
+def youtube_video_id(query):
+    """Accept a video ID, a YouTube URL, or a title to look up on youtube.com."""
+    if re.fullmatch(r"[\w-]{11}", query):
+        return query, query
+    parsed = urllib.parse.urlparse(query)
+    if parsed.netloc.endswith("youtu.be"):
+        return parsed.path.strip("/")[:11], query
+    if "youtube.com" in parsed.netloc:
+        v = urllib.parse.parse_qs(parsed.query).get("v")
+        if v:
+            return v[0], query
+        m = re.search(r"/(?:shorts|live|embed)/([\w-]{11})", parsed.path)
+        if m:
+            return m.group(1), query
+    url = "https://www.youtube.com/results?" + urllib.parse.urlencode({"search_query": query})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        html = r.read().decode(errors="replace")
+    m = re.search(r'"videoRenderer":\{"videoId":"([\w-]{11})"', html)
+    if not m:
+        raise LookupError(f"No YouTube result for {query!r}; pass the video's URL instead")
+    t = re.search(r'"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"', html[m.end():])
+    return m.group(1), json.loads(f'"{t.group(1)}"') if t else query
+
+
+def host_arg(args):
+    host = args.tv or load_config().get("default_tv")
+    if not host:
+        sys.exit("Give the TV's IP with --tv 192.168.x.y (it is remembered after the first time).")
+    return host
+
+
+# ---------- commands ----------
+
+def cmd_info(args):
+    tv = TV(host_arg(args))
+    log("CMD", "device info")
+    d = tv.info().get("device", {})
+    for k in ("name", "modelName", "model", "OS", "firmwareVersion", "PowerState",
+              "TokenAuthSupport", "networkType", "ip", "wifiMac", "resolution"):
+        if k in d:
+            print(f"  {k:<17} {d[k]}")
+
+
+def cmd_pair(args):
+    host = args.tv
+    cfg = load_config()
+    cfg["default_tv"] = host
+    save_config(cfg)
+    tv = TV(host)
+    log("CMD", "pair")
+    print(f"Model: {tv.info().get('device', {}).get('modelName', '?')}")
+    tv.connect()
+    tv.close()
+    print("Paired. Later commands can omit --tv.")
+
+
+def cmd_backup(args):
+    host = host_arg(args)
+    tv = TV(host)
+    folder = os.path.join(os.getcwd(), "backup-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(folder)
+    log("CMD", f"backup to {folder}")
+    with open(os.path.join(folder, "device.json"), "w") as f:
+        json.dump(tv.info(), f, indent=2)
+    tv.connect()
+    apps = tv.apps()
+    tv.close()
+    with open(os.path.join(folder, "apps.json"), "w") as f:
+        json.dump(apps, f, indent=2)
+    with open(os.path.join(folder, "apps.txt"), "w") as f:
+        for a in sorted(apps, key=lambda a: a.get("name", "")):
+            f.write(f"{a.get('appId', ''):<30} {a.get('name', '')}\n")
+    with open(os.path.join(folder, "settings-before.txt"), "w") as f:
+        f.write(SETTINGS_TEMPLATE)
+    print(f"Saved device.json, apps.json, apps.txt and settings-before.txt in {folder}")
+    print("Fill in settings-before.txt from the TV before changing anything (see README).")
+
+
+def cmd_apps(args):
+    tv = TV(host_arg(args))
+    tv.connect()
+    for a in sorted(tv.apps(), key=lambda a: a.get("name", "")):
+        print(f"  {a.get('appId', ''):<30} {a.get('name', '')}")
+    tv.close()
+
+
+def cmd_key(args):
+    tv = TV(host_arg(args))
+    tv.connect()
+    for k in args.keys:
+        if k.upper() in ("ENTER", "KEY_ENTER") and not confirm(
+                "About to press OK. Is the right item highlighted on the TV?", args.yes):
+            log("SKIP", "OK not pressed")
+            break
+        tv.key(k)
+        time.sleep(args.delay)
+    tv.close()
+
+
+def cmd_launch(args):
+    tv = TV(host_arg(args))
+    tv.connect()
+    tv.launch(args.app_id, args.meta)
+    tv.close()
+
+
+def cmd_youtube(args):
+    query = " ".join(args.video)
+    log("CMD", f"youtube {query!r}")
+    vid, title = youtube_video_id(query)
+    log("INFO", f"video {vid}: {title}")
+    tv = TV(host_arg(args))
+    tv.connect()
+
+    log("STEP", "1/4 Home")
+    tv.key("HOME")
+    time.sleep(1.5)
+
+    log("STEP", "2/4 open YouTube on the video")
+    if not tv.launch(YOUTUBE_APP_ID, f"v={vid}"):
+        log("WARN", "no launch reply; trying the REST endpoint")
+        req = urllib.request.Request(
+            f"http://{tv.host}:8001/api/v2/applications/{YOUTUBE_APP_ID}",
+            data=f"v={vid}".encode(), method="POST")
+        try:
+            urllib.request.urlopen(req, timeout=5)
+        except Exception as e:
+            log("WARN", f"REST launch failed: {e}")
+    time.sleep(args.wait)
+    log("INFO", f"YouTube status: {tv.app_status(YOUTUBE_APP_ID)}")
+
+    log("STEP", "3/4 'Who's watching?' check")
+    if not args.yes:
+        seen = input("\n>>> Is the TV showing \"Who's watching?\"  [y = yes / Enter = no] ").strip().lower()
+        if seen in ("y", "yes"):
+            if not confirm("Is YOUR profile highlighted? (use `tvctl.py key LEFT/RIGHT` "
+                           "in another terminal to move it first)", False):
+                log("STOP", "left the profile picker for you; run this command again after choosing")
+                tv.close()
+                return
+            tv.key("ENTER")
+            time.sleep(3)
+            log("STEP", "re-sending the video after the profile was chosen")
+            tv.launch(YOUTUBE_APP_ID, f"v={vid}")
+            time.sleep(args.wait)
+
+    log("STEP", "4/4 playback")
+    if confirm("Is the video playing? (answer n to press Play)", args.yes):
+        log("DONE", f"playing {title}")
+    else:
+        tv.key("PLAY")
+        log("DONE", "sent Play")
+    tv.close()
+
+
+def cmd_monitor(args):
+    """Tail the session log: each command with its timestamp, TV events while it runs."""
+    os.makedirs(HOME, exist_ok=True)
+    open(LOG, "a").close()
+    print(f"Watching {LOG} (Ctrl-C to stop)")
+    colors = {"CMD": "\033[1;36m", "STEP": "\033[1;33m", "DONE": "\033[1;32m",
+              "WARN": "\033[1;31m", "STOP": "\033[1;31m", "TV": "\033[2m"}
+    with open(LOG) as f:
+        f.seek(0, os.SEEK_END)
+        try:
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.2)
+                    continue
+                kind = line[15:20].strip()
+                print(colors.get(kind, "") + line.rstrip() + "\033[0m", flush=True)
+        except KeyboardInterrupt:
+            pass
+
+
+SETTINGS_TEMPLATE = """\
+Write the CURRENT value of each setting here before changing it (photo works too).
+
+DNS (Settings > General > Network > Network Status > IP Settings > DNS setting):
+  mode: ______  (Obtain automatically / Enter manually)   server: ______
+Interest-Based Advertisement: ______
+Viewing Information Services: ______
+Voice / other privacy choices touched: ______
+Autorun Smart Hub: ______      Autorun Last App: ______
+Home-bar apps removed (name, position): ______
+"""
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--tv", help="TV IP address (remembered after `pair`)")
+    p.add_argument("-y", "--yes", action="store_true", help="don't ask before pressing OK")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("info", help="model, firmware, power state (no pairing needed)").set_defaults(fn=cmd_info)
+    s = sub.add_parser("pair", help="connect and approve this computer on the TV")
+    s.add_argument("tv_ip")
+    s.set_defaults(fn=lambda a: cmd_pair(argparse.Namespace(**{**vars(a), "tv": a.tv_ip})))
+    sub.add_parser("backup", help="save device info and app list before changes").set_defaults(fn=cmd_backup)
+    sub.add_parser("apps", help="list installed apps").set_defaults(fn=cmd_apps)
+    s = sub.add_parser("key", help="press remote keys, e.g. key HOME RIGHT ENTER")
+    s.add_argument("keys", nargs="+")
+    s.add_argument("--delay", type=float, default=0.8)
+    s.set_defaults(fn=cmd_key)
+    s = sub.add_parser("launch", help="open an app by appId")
+    s.add_argument("app_id")
+    s.add_argument("--meta", default="")
+    s.set_defaults(fn=cmd_launch)
+    s = sub.add_parser("youtube", help="open YouTube and play a video (ID, URL or title)")
+    s.add_argument("video", nargs="+")
+    s.add_argument("--wait", type=float, default=8, help="seconds to let YouTube load")
+    s.set_defaults(fn=cmd_youtube)
+    sub.add_parser("monitor", help="live log of commands and TV events").set_defaults(fn=cmd_monitor)
+    args = p.parse_args()
+    try:
+        args.fn(args)
+    except (OSError, PermissionError, TimeoutError, LookupError, ConnectionError) as e:
+        log("ERR", str(e))
+        if "No route to host" in str(e) and sys.platform == "darwin":
+            print("macOS: System Settings > Privacy & Security > Local Network > allow your terminal, then retry.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
