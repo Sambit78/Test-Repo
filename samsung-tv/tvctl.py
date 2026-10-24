@@ -29,6 +29,13 @@ CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "session.log")
 CLIENT_NAME = "tvctl"
 YOUTUBE_APP_ID = "111299001912"
+# Checked one by one when the TV won't return its full app list (common on 2021+ models).
+KNOWN_APPS = {
+    "111299001912": "YouTube", "3201907018807": "Netflix", "11101200001": "Netflix (legacy)",
+    "3201910019365": "Prime Video", "3201512006785": "Prime Video (legacy)",
+    "3201901017640": "Disney+", "3201807016597": "Apple TV", "3201606009684": "Spotify",
+    "3201512006963": "Plex", "org.tizen.browser": "Internet",
+}
 
 
 # ---------- logging / monitor ----------
@@ -247,6 +254,19 @@ class TV:
         self.drain(1.5)
         return msg
 
+    def apps_or_probe(self):
+        try:
+            return self.apps()
+        except TimeoutError:
+            log("WARN", "TV did not send its app list (normal on many 2021+ models); checking common apps one by one")
+        found = []
+        for app_id, name in KNOWN_APPS.items():
+            st = self.app_status(app_id)
+            if "error" not in st:
+                found.append({"appId": app_id, "name": st.get("name") or name, "probed": True})
+        log("INFO", f"found {len(found)} of {len(KNOWN_APPS)} common apps")
+        return found
+
     def app_status(self, app_id):
         url = f"http://{self.host}:8001/api/v2/applications/{app_id}"
         try:
@@ -340,7 +360,7 @@ def cmd_backup(args):
     with open(os.path.join(folder, "device.json"), "w") as f:
         json.dump(tv.info(), f, indent=2)
     tv.connect()
-    apps = tv.apps()
+    apps = tv.apps_or_probe()
     tv.close()
     with open(os.path.join(folder, "apps.json"), "w") as f:
         json.dump(apps, f, indent=2)
@@ -356,7 +376,7 @@ def cmd_backup(args):
 def cmd_apps(args):
     tv = TV(host_arg(args))
     tv.connect()
-    for a in sorted(tv.apps(), key=lambda a: a.get("name", "")):
+    for a in sorted(tv.apps_or_probe(), key=lambda a: a.get("name", "")):
         print(f"  {a.get('appId', ''):<30} {a.get('name', '')}")
     tv.close()
 
