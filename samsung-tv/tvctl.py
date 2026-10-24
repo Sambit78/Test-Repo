@@ -22,6 +22,7 @@ import ssl
 import struct
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -352,6 +353,69 @@ class TV:
                 return False
         return False
 
+    def youtube_screen_id(self):
+        """The TV's YouTube screen ID, from its DIAL entry (starting YouTube if it isn't running)."""
+        url = self.dial_base().rstrip("/") + "/YouTube"
+        launched = False
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=5) as r:
+                    xml = r.read().decode(errors="replace")
+            except Exception as e:
+                log("WARN", f"DIAL status failed: {e}")
+                return None
+            m = re.search(r"<screenId>([^<]+)</screenId>", xml)
+            if m:
+                return m.group(1)
+            if not launched:
+                log("INFO", "YouTube has no screen ID yet; starting it")
+                self.youtube_dial("")
+                launched = True
+            time.sleep(1.5)
+        log("WARN", "YouTube never reported a screen ID")
+        return None
+
+    def youtube_lounge_play(self, video_id):
+        """Queue a video the way the YouTube phone app does when casting: pair with the
+        TV's YouTube app through youtube.com's lounge service, then set its playlist."""
+        screen = self.youtube_screen_id()
+        if not screen:
+            return False
+        log("CMD", f"YouTube cast: pairing with screen {screen[:8]}...")
+        try:
+            data = urllib.parse.urlencode({"screen_ids": screen}).encode()
+            with urllib.request.urlopen("https://www.youtube.com/api/lounge/pairing/get_lounge_token_batch",
+                                        data=data, timeout=10) as r:
+                token = json.load(r)["screens"][0]["loungeToken"]
+            bind = "https://www.youtube.com/api/lounge/bc/bind?"
+            headers = {"X-YouTube-LoungeId-Token": token}
+            rid = int(time.time()) % 90000 + 10000
+            params = {"RID": rid, "VER": 8, "CVER": 1}
+            device = {"device": "REMOTE_CONTROL", "id": uuid.uuid4().hex, "name": "tvctl",
+                      "mdx-version": 3, "pairing_type": "cast", "app": "android-phone-13.14.55"}
+            req = urllib.request.Request(bind + urllib.parse.urlencode(params),
+                                         data=urllib.parse.urlencode(device).encode(), headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                text = r.read().decode(errors="replace")
+            sid = re.search(r'"c","(.*?)",', text)
+            gsession = re.search(r'"S","(.*?)"\]', text)
+            if not (sid and gsession):
+                log("WARN", "YouTube cast: no session in the pairing reply")
+                return False
+            params = {"SID": sid.group(1), "gsessionid": gsession.group(1), "RID": rid + 1, "VER": 8, "CVER": 1}
+            action = {"count": 1, "req0__sc": "setPlaylist", "req0_videoId": video_id,
+                      "req0_currentTime": 0, "req0_currentIndex": -1, "req0_audioOnly": "false",
+                      "req0_listId": ""}
+            req = urllib.request.Request(bind + urllib.parse.urlencode(params),
+                                         data=urllib.parse.urlencode(action).encode(), headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                log("INFO", f"YouTube cast: video queued ({r.status})")
+                return r.status == 200
+        except Exception as e:
+            log("WARN", f"YouTube cast failed: {e}")
+            return False
+
     def close_app(self, app_id):
         """Close an app so the next launch is a cold start (deep links only apply then)."""
         log("CMD", f"close {app_id}")
@@ -530,6 +594,10 @@ def cmd_youtube(args):
     time.sleep(1.5)
 
     def open_video(cold):
+        if tv.youtube_lounge_play(vid):
+            time.sleep(args.wait)
+            return
+        log("INFO", "trying a plain DIAL launch")
         if tv.youtube_dial(vid):
             time.sleep(args.wait)
             return
