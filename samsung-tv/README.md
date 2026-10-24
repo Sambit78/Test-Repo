@@ -2,7 +2,7 @@
 
 ## What this TV is
 
-The photo shows a **Samsung Smart TV running Tizen**, not Android TV, Google TV or Fire TV. You can tell from the Samsung Smart Hub home bar, Samsung TV Plus, "Samsung Promotion" and the Settings/Source/Ambient icons on the left. The exact model isn't visible in the photo. `python3 tvctl.py info` reads it from the TV. You can also find it under **Settings → Support → About This TV**.
+The photo shows a **Samsung Smart TV running Tizen**, not Android TV, Google TV or Fire TV. You can tell from the Samsung Smart Hub home bar, Samsung TV Plus, "Samsung Promotion" and the Settings/Source/Ambient icons on the left. The second photo (Settings → General → System Manager) shows the model: **Samsung Q60AA 75"**. That's the 2021 QLED Q60A, Australian version, running Tizen 6. The menu paths below follow the 2021 layout.
 
 That means **ADB can't be used**: the TV has no Developer options, no USB or Wireless debugging, no logcat, no `pm disable`, no animation scale and no Private DNS. Samsung's official local-network control allows only the following, and `tvctl.py` uses nothing else:
 
